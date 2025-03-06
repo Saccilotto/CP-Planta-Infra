@@ -1,0 +1,105 @@
+name: Deploy Infrastructure
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      provider:
+        description: 'Cloud Provider (aws or azure)'
+        required: true
+        default: 'aws'
+        type: choice
+        options:
+          - aws
+          - azure
+  repository_dispatch:
+    types:
+      - frontend-update
+      - backend-update
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    
+    env:
+      SSH_USER: ${{ secrets.SSH_USER }}
+      STATIC_IP_1: ${{ secrets.STATIC_IP_1 }}
+      STATIC_IP_2: ${{ secrets.STATIC_IP_2 }}
+      PEM_FILE_PATH: "${{ github.workspace }}/ssh_keys/CPPlanta1.pem"
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_REGION: ${{ secrets.AWS_REGION }}
+      ARM_CLIENT_ID: ${{ secrets.ARM_CLIENT_ID }}
+      ARM_CLIENT_SECRET: ${{ secrets.ARM_CLIENT_SECRET }}
+      ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+      ARM_TENANT_ID: ${{ secrets.ARM_TENANT_ID }}
+      TF_VAR_project_name: "CP-Planta"
+      TF_VAR_environment: "production"
+      
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+      
+      - name: Setup environment
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ansible docker.io python3 python3-pip openssh-client
+          mkdir -p ssh_keys
+          
+          # Create .env file
+          echo "AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID" > .env
+          echo "AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY" >> .env
+          echo "AWS_REGION=$AWS_REGION" >> .env
+          echo "ARM_CLIENT_ID=$ARM_CLIENT_ID" >> .env
+          echo "ARM_CLIENT_SECRET=$ARM_CLIENT_SECRET" >> .env
+          echo "ARM_SUBSCRIPTION_ID=$ARM_SUBSCRIPTION_ID" >> .env
+          echo "ARM_TENANT_ID=$ARM_TENANT_ID" >> .env
+          echo "PROJECT_NAME=CP-Planta" >> .env
+          echo "ENVIRONMENT=production" >> .env
+          
+          # Make deploy script executable
+          chmod +x ./deploy.sh
+      
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: '1.5.0'
+      
+      - name: Use existing infrastructure (if applicable)
+        if: ${{ github.event.inputs.provider == '' && env.STATIC_IP_1 != '' && env.STATIC_IP_2 != '' }}
+        run: |
+          # Create static_ip.ini file from template
+          cp static_ip.ini.example static_ip.ini
+          sed -i "s|10.0.0.1|$STATIC_IP_1|" static_ip.ini
+          sed -i "s|10.0.0.2|$STATIC_IP_2|" static_ip.ini
+          sed -i "s|ubuntu|$SSH_USER|g" static_ip.ini
+          
+          # Write PEM key from secrets
+          echo "${{ secrets.PEM_FILE_CONTENT }}" > $PEM_FILE_PATH
+          chmod 400 $PEM_FILE_PATH
+          
+          # Run only the Ansible part
+          cd Swarm/
+          ANSIBLE_CONFIG=./ansible.cfg ansible-playbook -i ../static_ip.ini ./swarm_setup.yml
+      
+      - name: Deploy infrastructure
+        run: |
+          # Determine which provider to use
+          PROVIDER="${{ github.event.inputs.provider }}"
+          if [ -z "$PROVIDER" ]; then
+            PROVIDER="${{ secrets.DEFAULT_PROVIDER }}"  # Use from secrets if set
+          fi
+          if [ -z "$PROVIDER" ]; then
+            PROVIDER="aws"  # Default to AWS if not specified anywhere
+          fi
+          
+          echo "Deploying with provider: $PROVIDER"
+          if [[ "${{ github.event_name }}" == "repository_dispatch" ]]; then
+            echo "Triggered by ${{ github.event.action }} repository update"
+          fi
+          
+          # Run deploy script with specified provider
+          ./deploy.sh --provider $PROVIDER
